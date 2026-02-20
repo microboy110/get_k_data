@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+env
+.env
+.env.*
+
+# IDE / 编辑器
+.idea
+.vscode
+*.swp
+*.swo
+
+# 测试与文档
+.pytest_cache
+.coverage
+htmlcov
+*.md
+!README.md
+
+# 构建与 CI（避免把 CI 配置打进镜像）
+.github
+
+# 其他
+*.log
+.DS_Store
