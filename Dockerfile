@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # 构建阶段：安装依赖（可选多阶段时仅复制 venv，此处保持单阶段以简化）
-ARG PYTHON_VERSION=3.10-slim
+ARG PYTHON_VERSION=3.12-slim
 FROM python:${PYTHON_VERSION} AS builder
 
 WORKDIR /app
@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt 'uvicorn[standard]'
 
 # 运行阶段
-ARG PYTHON_VERSION=3.10-slim
+ARG PYTHON_VERSION=3.12-slim
 FROM python:${PYTHON_VERSION}
 
 LABEL maintainer="zeabur"
@@ -41,3 +41,4 @@ USER app
 
 # 使用 PORT 环境变量，便于云平台动态端口
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+
