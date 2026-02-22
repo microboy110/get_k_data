@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import pandas as pd
 import numpy as np
-import os
+import os,time
 import math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -19,21 +19,64 @@ app.add_middleware(
 
 sem = asyncio.Semaphore(30) 
 
-# --- 新增：简单主页，用于 Zeabur 健康检查 ---
-@app.get("/")
-async def get_index():
-    return HTMLResponse("""
-        <html>
-            <body style="display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;background:#131722;color:white;font-family:sans-serif;">
-                <h1 style="color:#2962ff;">Hello World!</h1>               
-                <div style="font-size:12px;color:#5d606b;">Status: Online</div>
-            </body>
-        </html>
-    """)
+# --- 全局标的管理类 ---
+class SymbolManager:
+    def __init__(self):
+        self.active_symbols = []
+        self.update_interval = 3600  # 1小时更新一次
 
+    async def update_symbols_loop(self):
+        """后台定时扫描任务"""
+        while True:
+            try:
+                print("正在扫描活跃标的...")
+                url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        df = pd.DataFrame(data)
+                        
+                        # 1. 基础过滤：仅限 USDT 永续合约
+                        df = df[df['symbol'].str.endswith('USDT')]
+                        # --- 新增过滤逻辑：过滤掉 openTime 在 24 小时以前的标的 ---
+						# 获取当前毫秒时间戳
+                        current_ms = int(time.time() * 1000)
+						# 计算 24 小时前的毫秒数 (24 * 60 * 60 * 1000)
+                        twenty_four_hours_ago = current_ms - 86400000 - 600000
 
+						# 确保 openTime 是数值类型并进行过滤
+                        df['openTime'] = pd.to_numeric(df['openTime'])
+                        df = df[df['openTime'] >= twenty_four_hours_ago]
+						# ---------------------------------------------------
+                        # 数值化
+                        df['quoteVolume'] = pd.to_numeric(df['quoteVolume'])
+                        df['high'] = pd.to_numeric(df['highPrice'])
+                        df['low'] = pd.to_numeric(df['lowPrice'])
+                        
+                        # 2. 第一阶段：按成交额排序，取前 200
+                        df = df.sort_values(by='quoteVolume', ascending=False).head(200)
+                        
+                        # 3. 第二阶段：计算振幅并排序，取前 50
+                        df['amplitude'] = (df['high'] - df['low']) / df['low']
+                        df = df.sort_values(by='amplitude', ascending=False).head(50)
+                        
+                        self.active_symbols = df['symbol'].tolist()
+                        print(f"扫描完成！当前监控标的：{self.active_symbols[:5]}...等50个")
+            except Exception as e:
+                print(f"扫描标的出错: {e}")
+            
+            await asyncio.sleep(self.update_interval)
+
+symbol_manager = SymbolManager()
+
+@app.on_event("startup")
+async def startup_event():
+    # 启动时立即运行一次扫描，并开启后台循环
+    asyncio.create_task(symbol_manager.update_symbols_loop())
+
+# --- 辅助工具 ---
 def clean_val(val):
-    """将 Python/Pandas 的 NaN/Inf 转换为 JSON 兼容的 None (null)"""
     if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
         return None
     return float(val)
@@ -45,9 +88,10 @@ async def get_data(client, url, params, label):
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:
-            print(f"[{label}] 请求异常: {e}")
+            pass
         return []
 
+# --- 策略核心逻辑 ---
 async def fetch_binance_data(symbol: str, is_init=False):
     fapi = "https://fapi.binance.com"
     data_api = "https://fapi.binance.com/futures/data"
@@ -65,70 +109,36 @@ async def fetch_binance_data(symbol: str, is_init=False):
         df.columns = ['ts', 'open', 'high', 'low', 'close', 'vol']
         df = df.apply(pd.to_numeric)
 
-        df_oi = pd.DataFrame(oi_raw)
-        if not df_oi.empty:
-            df_oi = df_oi[['timestamp', 'sumOpenInterest']].apply(pd.to_numeric)
-            df_oi.rename(columns={'timestamp': 'ts', 'sumOpenInterest': 'oi'}, inplace=True)
-            df = pd.merge(df, df_oi, on='ts', how='left').ffill()
-        else:
-            df['oi'] = 0
-
-        # --- 修改后的策略逻辑：趋势识别 + 能量确认 ---
-        # 1. 计算三条均线（趋势识别核心）
+        # 均线计算
         df['sma7'] = df['close'].rolling(7).mean()
         df['sma14'] = df['close'].rolling(14).mean()
         df['sma21'] = df['close'].rolling(21).mean()
         
-        # 2. 计算均线间距（趋势强度确认）
-        df['spacing_7_14'] = abs(df['sma7'] - df['sma14']) / df['close']
-        df['spacing_14_21'] = abs(df['sma14'] - df['sma21']) / df['close']
-        
-        # 3. 计算均线斜率方向一致性（趋势稳定性）
+        # 趋势强度与一致性
         df['sma7_slope'] = df['sma7'] - df['sma7'].shift(3)
         df['sma14_slope'] = df['sma14'] - df['sma14'].shift(3)
         df['sma21_slope'] = df['sma21'] - df['sma21'].shift(3)
-        df['slope_consistency'] = ((df['sma7_slope'] > 0) & 
-                                  (df['sma14_slope'] > 0) & 
-                                  (df['sma21_slope'] > 0)).astype(int)
+        slope_consistency = (df['sma7_slope'] > 0) & (df['sma14_slope'] > 0) & (df['sma21_slope'] > 0)
         
-        # 4. 计算成交量指标（能量确认核心）
-        df['vol_ma'] = df['vol'].rolling(14).mean()
-        df['vol_ratio'] = df['vol'] / df['vol_ma']
+        # 动态阈值 (ATR)
+        tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+        dynamic_threshold = atr / df['close'] * 0.3
         
-        # 5. 均线排列判断（趋势结构确认）
-        df['bullish_arrangement'] = ((df['close'] > df['sma7']) & 
-                                    (df['sma7'] > df['sma14']) & 
-                                    (df['sma14'] > df['sma21'])).astype(int)
+        spacing_7_14 = (df['sma7'] - df['sma14']).abs() / df['close']
         
-        df['bearish_arrangement'] = ((df['close'] < df['sma7']) & 
-                                    (df['sma7'] < df['sma14']) & 
-                                    (df['sma14'] < df['sma21'])).astype(int)
+        # 排列判断
+        bullish = (df['close'] > df['sma7']) & (df['sma7'] > df['sma14']) & (df['sma14'] > df['sma21'])
         
-        # 6. 计算ATR用于动态间距阈值（自适应优化）
-        tr = pd.concat([(df['high'] - df['low']), 
-                        (df['high'] - df['close'].shift()).abs(), 
-                        (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(14).mean()
-        df['dynamic_spacing_threshold'] = df['atr'] / df['close'] * 0.3
+        # 成交量确认
+        vol_ratio = df['vol'] / df['vol'].rolling(14).mean()
         
-        # 7. 策略信号生成 - 趋势识别条件
-        trend_condition = (
-            (df['bullish_arrangement'] == 1) &                    # 多头排列
-            (df['slope_consistency'] == 1) &                      # 均线同向向上
-            (df['spacing_7_14'] > df['dynamic_spacing_threshold']) &  # 动态间距确认
-            (df['spacing_14_21'] > df['dynamic_spacing_threshold'] * 0.4)   # 动态间距确认
-        )
+        # --- 信号生成：同一个波段只触发一次 ---
+        # 原始条件满足状态
+        raw_condition = (bullish) & (slope_consistency) & (spacing_7_14 > dynamic_threshold) & (vol_ratio > 1.2)
         
-        # 8. 能量确认条件
-        energy_condition = (
-            df['vol_ratio'] > 1.2                            # 成交量放大
-            #(df['vol_ratio'] > 1.5) &                             # 成交量放大
-            #(df['oi'] > df['oi'].shift(1)) &                      # 持仓量增加
-            #(df['oi'] > df['oi'].rolling(14).mean() * 1.1)        # 持仓量相对平均水平增加
-        )
-        
-        # 9. 综合入场信号
-        df['is_entry'] = trend_condition & energy_condition
+        # 上升沿触发：当前为真且上一个为假
+        df['is_entry'] = raw_condition & (~raw_condition.shift(1).fillna(False))
 
         def format_row(idx):
             if idx < 0 or idx >= len(df): return None
@@ -139,13 +149,12 @@ async def fetch_binance_data(symbol: str, is_init=False):
                 "high": clean_val(row['high']),
                 "low": clean_val(row['low']),
                 "close": clean_val(row['close']),
-                "is_entry": bool(row['is_entry']) if not pd.isna(row['is_entry']) else False,
+                "is_entry": bool(row['is_entry']),
                 "metrics": {
                     "sma7": clean_val(row.get('sma7')),
-                    "sma14": clean_val(row.get('sma14')),
+					"sma14": clean_val(row.get('sma14')),
                     "sma21": clean_val(row.get('sma21')),
-                    "vol_ratio": clean_val(row.get('vol_ratio')),
-                    "oi_current": clean_val(row.get('oi'))
+                    "vol_ratio": clean_val(row.get('vol_ratio'))
                 }
             }
 
@@ -154,19 +163,32 @@ async def fetch_binance_data(symbol: str, is_init=False):
         else:
             return {"symbol": symbol, "type": "UPDATE", "data": [format_row(len(df)-2),format_row(len(df)-1)]}
 
-@app.websocket("/ws/strategy/{symbols}")
-async def websocket_endpoint(websocket: WebSocket, symbols: str):
+# --- WebSocket 路由 ---
+@app.websocket("/ws/strategy")
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    symbol_list = [s.strip().upper() for s in symbols.split(",")]
     try:
-        init_results = await asyncio.gather(*[fetch_binance_data(s, True) for s in symbol_list])
+        # 初始等待标的扫描完成
+        while not symbol_manager.active_symbols:
+            await asyncio.sleep(1)
+            
+        current_symbols = symbol_manager.active_symbols
+        init_results = await asyncio.gather(*[fetch_binance_data(s, True) for s in current_symbols])
         await websocket.send_json([r for r in init_results if r])
+        
         while True:
             await asyncio.sleep(60) 
-            update_results = await asyncio.gather(*[fetch_binance_data(s, False) for s in symbol_list])
+            # 实时更新使用当前最新的标的列表
+            active_list = symbol_manager.active_symbols
+            update_results = await asyncio.gather(*[fetch_binance_data(s, False) for s in active_list])
             if update_results:
                 await websocket.send_json([r for r in update_results if r])
-    except Exception as e: print(f"WS Error: {e}")
+    except Exception as e: 
+        print(f"WS Error: {e}")
+
+@app.get("/")
+async def get_index():
+    return HTMLResponse("<h1>Hello World !</h1>")
 
 if __name__ == "__main__":
     import uvicorn
