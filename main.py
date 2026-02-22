@@ -138,7 +138,7 @@ async def fetch_binance_data(symbol: str, is_init=False):
         raw_condition = (bullish) & (slope_consistency) & (spacing_7_14 > dynamic_threshold) & (vol_ratio > 1.2)
         
         # 上升沿触发：当前为真且上一个为假
-        df['is_entry'] = raw_condition & (~raw_condition.shift(1).fillna(False))
+        df['is_entry'] = raw_condition & (~raw_condition.shift(1).fillna(False).infer_objects())
 
         def format_row(idx):
             if idx < 0 or idx >= len(df): return None
