@@ -27,7 +27,7 @@ RUN addgroup --system --gid 1000 app && \
 WORKDIR /app
 
 # 从 builder 复制已安装的包（同阶段则直接在本镜像安装）
-COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # 应用代码
@@ -41,4 +41,5 @@ USER app
 
 # 使用 PORT 环境变量，便于云平台动态端口
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+
 
