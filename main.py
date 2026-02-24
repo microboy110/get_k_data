@@ -167,7 +167,7 @@ async def fetch_binance_data(symbol: str, is_init=False):
                     "ema7": clean_val(row.get('ema7')),
                     "ema14": clean_val(row.get('ema14')),
                     "ema21": clean_val(row.get('ema21')),
-                    "vol_ratio": clean_val(row.get('vol_ratio'))
+                    "vol": clean_val(row.get('vol'))
                 }
             }
 
