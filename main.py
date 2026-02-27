@@ -1,7 +1,6 @@
 import asyncio
 import httpx
 import pandas as pd
-pd.set_option('future.no_silent_downcasting', True)
 import numpy as np
 import os, time
 import math
@@ -31,7 +30,7 @@ class SymbolManager:
         """后台定时扫描任务"""
         while True:
             try:
-                print("正在扫描活跃标的...")
+                print("正在执行 [方案二 + 防异常值优化] 扫描...")
                 url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(url, timeout=10.0)
@@ -41,29 +40,50 @@ class SymbolManager:
                         
                         # 1. 基础过滤：仅限 USDT 永续合约
                         df = df[df['symbol'].str.endswith('USDT')]
-                        # --- 新增过滤逻辑：过滤掉 openTime 在 24 小时以前的标的 ---
+                        
+                        # 时间过滤逻辑
                         current_ms = int(time.time() * 1000)
                         twenty_four_hours_ago = current_ms - 86400000 - 600000
-
-                        # 确保 openTime 是数值类型并进行过滤
                         df['openTime'] = pd.to_numeric(df['openTime'])
                         df = df[df['openTime'] >= twenty_four_hours_ago]
-                        # ---------------------------------------------------
+
                         # 数值化
                         df['quoteVolume'] = pd.to_numeric(df['quoteVolume'])
                         df['high'] = pd.to_numeric(df['highPrice'])
                         df['low'] = pd.to_numeric(df['lowPrice'])
-                        
-                        # 2. 第一阶段：按成交额排序，取前 200
-                        df = df.sort_values(by='quoteVolume', ascending=False).head(200)
-                        
-                        # 3. 第二阶段：计算振幅并排序，取前 50
                         df['amplitude'] = (df['high'] - df['low']) / df['low']
-                        df = df.sort_values(by='amplitude', ascending=False).head(50)
 
+                        if not df.empty:
+                            # --- 异常值优化 A：成交额对数化 ---
+                            # 加密货币成交额差距极大（BTC vs 小币），Log化能让分布更均匀
+                            df['processed_vol'] = np.log1p(df['quoteVolume'])
+
+                            # --- 异常值优化 B：百分位盖帽法 (Clipping) ---
+                            # 限制在 1% 到 99% 分位数之间，剔除极端插针或流动性瞬间缺失的干扰
+                            for col in ['processed_vol', 'amplitude']:
+                                lower_bound = df[col].quantile(0.01)
+                                upper_bound = df[col].quantile(0.99)
+                                df[col] = df[col].clip(lower_bound, upper_bound)
+
+                            # --- 归一化函数 ---
+                            def normalize(series):
+                                s_min = series.min()
+                                s_max = series.max()
+                                if s_max <= s_min:
+                                    return 0
+                                return (series - s_min) / (s_max - s_min)
+
+                            # 执行归一化
+                            df['norm_vol'] = normalize(df['processed_vol'])
+                            df['norm_amp'] = normalize(df['amplitude'])
+
+                            # --- 综合评分：0.3 额 / 0.7 振 ---
+                            df['score'] = (df['norm_vol'] * 0.3) + (df['norm_amp'] * 0.7)
+
+                            # 排序取前 50
+                            df = df.sort_values(by='score', ascending=False).head(80)
+                        
                         new_symbols = df['symbol'].tolist()
-
-                        # 更新 active_symbols 并记录每个symbol的openTime
                         self.active_symbols = new_symbols
                         for _, row in df.iterrows():
                             self.symbol_info[row['symbol']] = {
@@ -71,7 +91,7 @@ class SymbolManager:
                                 'last_update_time': current_ms
                             }
 
-                        print(f"扫描完成！当前监控标的：{new_symbols[:5]}...等50个")
+                        print(f"扫描完成！当前综合评分最高标的：{new_symbols[:5]}")
             except Exception as e:
                 print(f"扫描标的出错: {e}")
             
