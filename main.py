@@ -80,7 +80,7 @@ class SymbolManager:
                             # --- 综合评分：0.3 额 / 0.7 振 ---
                             df['score'] = (df['norm_vol'] * 0.3) + (df['norm_amp'] * 0.7)
 
-                            # 排序取前 50
+                            # 排序取前 80
                             df = df.sort_values(by='score', ascending=False).head(80)
                         
                         new_symbols = df['symbol'].tolist()
@@ -123,53 +123,68 @@ async def get_data(client, url, params, label):
 # --- 策略核心逻辑 ---
 async def fetch_binance_data(symbol: str, is_init=False):
     fapi = "https://fapi.binance.com"
-    #data_api = "https://fapi.binance.com/futures/data"
+    data_api = "https://fapi.binance.com/futures/data" # 1. 启用 data_api
 
     async with httpx.AsyncClient() as client:
+        # 2. 并行请求 K线 和 持仓数据
         tasks = [
-            get_data(client, f"{fapi}/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 200}, "K线")
+            get_data(client, f"{fapi}/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 200}, "K线"),
+            get_data(client, f"{data_api}/openInterestHist", {"symbol": symbol, "period": "5m", "limit": 200}, "持仓")
         ]
-        klines = await asyncio.gather(*tasks)
-        klines = klines[0]
+        klines_raw, oi_raw = await asyncio.gather(*tasks)
 
-        # ⚠️ 保持原逻辑：不足110根直接返回None
-        if not klines or len(klines) < 110:
-            print(f"[INFO] Not enough data for {symbol}: {len(klines)} klines, skipping...")
+        if not klines_raw or len(klines_raw) < 110:
+            print(f"[INFO] Not enough data for {symbol}: {len(klines_raw)} klines, skipping...")
             return None
 
-        df = pd.DataFrame(klines).iloc[:, :6]
+        # 3. 处理 K 线数据
+        df = pd.DataFrame(klines_raw).iloc[:, :6]
         df.columns = ['ts', 'open', 'high', 'low', 'close', 'vol']
         df = df.apply(pd.to_numeric)
+        df = df.sort_values('ts') # merge_asof 必须排序
 
-        # --- 改为 EMA ---
+        # 4. 处理持仓数据并使用 merge_asof 对齐
+        df_oi = pd.DataFrame(oi_raw)
+        if not df_oi.empty:
+            # 提取 timestamp 和 sumOpenInterest
+            df_oi = df_oi[['timestamp', 'sumOpenInterest']].apply(pd.to_numeric)
+            df_oi.rename(columns={'timestamp': 'ts', 'sumOpenInterest': 'oi'}, inplace=True)
+            df_oi = df_oi.sort_values('ts')
+
+            # 核心对齐逻辑：寻找 <= K线时间戳的最接近持仓记录
+            # tolerance=300000 表示允许持仓数据滞后最多 5 分钟
+            df = pd.merge_asof(df, df_oi, on='ts', direction='backward', tolerance=300000)
+            df['oi'] = df['oi'].ffill() # 缺失值前向填充
+        else:
+            df['oi'] = 0
+
+        # --- 以下保持原有的指标计算逻辑 ---
         df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
         df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
-        # 趋势强度与一致性
         df['ema7_slope'] = df['ema7'] - df['ema7'].shift(3)
         df['ema14_slope'] = df['ema14'] - df['ema14'].shift(3)
         df['ema21_slope'] = df['ema21'] - df['ema21'].shift(3)
         slope_consistency = (df['ema7_slope'] > 0) & (df['ema14_slope'] > 0) & (df['ema21_slope'] > 0)
 
-        # 动态阈值 (ATR)
+		# 动态阈值 (ATR)
         tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         atr = tr.rolling(14).mean()
         dynamic_threshold = atr / df['close'] * 0.3
-
+		
+		# 排列判断
         spacing_7_14 = (df['ema7'] - df['ema14']).abs() / df['close']
-
-        # 排列判断
         bullish = (df['close'] > df['ema7']) & (df['ema7'] > df['ema14']) & (df['ema14'] > df['ema21'])
-
-        # 成交量确认
+		
+		# 成交量确认
         vol_ratio = df['vol'] / df['vol'].rolling(14).mean()
 		
-        # --- 新增策略条件：当前收盘价 > 前三根K线最高价 ---
-        df['prev3_max_high'] = df['high'].shift(1).rolling(window=3).max()  # 前三根K线的最高价（不包含当前）
+		# --- 新增策略条件：当前收盘价 > 前三根K线最高价 ---
+        df['prev3_max_high'] = df['high'].shift(1).rolling(window=3).max()
         df['close_gt_prev3_high'] = df['close'] > df['prev3_max_high']		
 
-        # --- 信号生成：同一个波段只触发一次 ---
+		# --- 信号生成：同一个波段只触发一次 ---
         raw_condition = (bullish) & (slope_consistency) & (spacing_7_14 > dynamic_threshold) & (vol_ratio > 1.2)& (df['close_gt_prev3_high'])
         df['is_entry'] = raw_condition & (~raw_condition.shift(1).fillna(False).infer_objects())
 
@@ -177,7 +192,7 @@ async def fetch_binance_data(symbol: str, is_init=False):
             if idx < 0 or idx >= len(df): return None
             row = df.iloc[idx]
             return {
-                "time": int(row['ts'] / 1000),
+                "time": int(row['ts'] / 1000), # 这里的 time 也是持仓数据的 timestamp
                 "open": clean_val(row['open']),
                 "high": clean_val(row['high']),
                 "low": clean_val(row['low']),
@@ -187,7 +202,8 @@ async def fetch_binance_data(symbol: str, is_init=False):
                     "ema7": clean_val(row.get('ema7')),
                     "ema14": clean_val(row.get('ema14')),
                     "ema21": clean_val(row.get('ema21')),
-                    "vol": clean_val(row.get('vol'))
+                    "vol": clean_val(row.get('vol')),
+                    "oi": clean_val(row.get('oi')) # 5. 将持仓数据返回给前端
                 }
             }
 
